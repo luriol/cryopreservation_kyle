@@ -1,72 +1,54 @@
-import struct
-import os
-import numpy as np
-
-
-N_SAMPLES   = 8192
-BYTES_PER_ADC_ARRAY = N_SAMPLES * 2
-BYTES_TIME  = 4
-BYTES_ADC   = BYTES_PER_ADC_ARRAY * 2
-TOTAL_BYTES = BYTES_ADC + BYTES_TIME
-
-
-def pt1000_lookup(R):
+def pt1000_lookup(R_measured):
     """
-    Estimate temperature (°C) from Pt1000 resistance (Ω) using linear interpolation
-    based on standard reference values.
-
-
-    Parameters:
-    -----------
-    R : float or array-like
-        Resistance of the Pt1000 sensor in ohms
-
-
-    Returns:
-    --------
-    T : float or ndarray
-        Estimated temperature in degrees Celsius
+    Given resistance R in ohms, return the corresponding temperature in °C
+    for a Pt1000 using the inverse of the Callendar–Van Dusen equation.
+    Returns -999.0 on any error or out-of-range input.
     """
-    T_ref = [-90,-80, -70, -60, -50, -40, -30, -20, -10, 0, 10, 20, 30]
-    R_ref = [643.00,683.25, 723.30, 763.30, 803.10, 842.70, 882.20, 921.60, 
-             960.90, 1000.00, 1039.00, 1077.90, 1116.70]
+    # Constants for Pt1000 (ITS-90)
+    R0 = 1000.0
+    A = 3.9083e-3
+    B = -5.775e-7
+    C_neg = -4.183e-12  # Only used for T < 0 °C
 
+    # Quick input guards
+    if R_measured is None or not np.isfinite(R_measured):
+        return -999.0
 
-    T = np.interp(R, R_ref, T_ref)
-    return T
+    def R_of_T(T):
+        C = C_neg if T < 0 else 0.0
+        return R0 * (1 + A*T + B*T*T + C*(T - 100.0)*T**3)
 
+    # Physical validity check for the given bracket
+    Tmin, Tmax = -200.0, 850.0
+    Rmin, Rmax = R_of_T(Tmin), R_of_T(Tmax)
+    lo, hi = (min(Rmin, Rmax), max(Rmin, Rmax))
+    if not (lo <= R_measured <= hi):
+        return -999.0
 
+    try:
+        # Use analytic inverse for T >= 0: R = R0 * (1 + A T + B T^2)
+        if R_measured >= R0:
+            # Solve B T^2 + A T + (1 - R/R0) = 0
+            c = 1.0 - (R_measured / R0)
+            disc = A*A - 4.0*B*c
+            if disc < 0.0:
+                return -999.0
+            # Pick the physically meaningful root (positive T, B < 0)
+            T1 = (-A + np.sqrt(disc)) / (2.0*B)
+            T2 = (-A - np.sqrt(disc)) / (2.0*B)
+            # Choose the root ≥ 0 and within [0, Tmax]
+            candidates = [t for t in (T1, T2) if np.isfinite(t) and (0.0 <= t <= Tmax)]
+            if candidates:
+                return float(candidates[0])
+            # Fallback to numeric if analytic selection failed
+            sol = root_scalar(lambda T: R_of_T(T) - R_measured,
+                              bracket=[0.0, Tmax], method='brentq')
+            return float(sol.root) if sol.converged else -999.0
 
+        # For T < 0, use full CVD with C term and brentq in [-200, 0]
+        sol = root_scalar(lambda T: R_of_T(T) - R_measured,
+                          bracket=[Tmin, 0.0], method='brentq')
+        return float(sol.root) if sol.converged else -999.0
 
-
-
-def get_teensy_binary_data(fp):     
-    raw = fp.read()
-
-
-    cap_adc_data    = raw[:BYTES_PER_ADC_ARRAY]
-    therm_adc_data  = raw[BYTES_PER_ADC_ARRAY:2 * BYTES_PER_ADC_ARRAY]
-    time_data       = raw[2 * BYTES_PER_ADC_ARRAY:]
-
-
-    cap_readings    = struct.unpack('<' + 'H' * N_SAMPLES, cap_adc_data)
-    therm_readings  = struct.unpack('<' + 'H' * N_SAMPLES, therm_adc_data)
-    total_time_us   = struct.unpack('<I', time_data)[0]
-
-
-    ADC_MAX     = 1023.0
-    V_REF       = 3.25
-    R_OHMS      = 1000000  # 1 MΩ
-    CONFIRM_SAMPLES = 5
-    R_REF = 1000.0       # Reference resistor in ohms
-    # process the data 
-    voltages = np.array(cap_readings) *V_REF / ADC_MAX 
-    voltage_therm = np.average(np.array(therm_readings) * V_REF / ADC_MAX)
-    R_therm = R_REF*voltage_therm/(V_REF-voltage_therm)
-    T_therm = pt1000_lookup(R_therm)
-    times = np.linspace(0, total_time_us, N_SAMPLES)
-
-
-
-
-    return times, voltages, T_therm 
+    except Exception:
+        return -999.0
